@@ -41,9 +41,11 @@ class TariffSavingsPlugin(PredBatPlugin):
         self.processing = False
 
     def register_hooks(self, plugin_system):
+        self.log("TariffSavings: register_hooks() called - registering hooks")
         plugin_system.register_hook("on_init", self.on_init)
         plugin_system.register_hook("on_update", self.on_update)
         plugin_system.register_hook("on_web_start", self.on_web_start)
+        self.log("TariffSavings: hooks registered (on_init, on_update, on_web_start)")
 
     # ------------------------------------------------------------------
     # Configuration / storage
@@ -132,7 +134,9 @@ class TariffSavingsPlugin(PredBatPlugin):
             return False
 
     def on_init(self):
+        self.log("TariffSavings: on_init() called")
         self._load_storage()
+        self.log("TariffSavings: on_init() complete, loaded={}".format(self.loaded))
 
     # ------------------------------------------------------------------
     # Current-day capture
@@ -567,6 +571,7 @@ class TariffSavingsPlugin(PredBatPlugin):
     # ------------------------------------------------------------------
 
     def on_web_start(self):
+        self.log("TariffSavings: on_web_start() called")
         components = getattr(self.base, "components", None)
         web_component = components.get_component("web") if components else None
         if not web_component:
@@ -575,6 +580,7 @@ class TariffSavingsPlugin(PredBatPlugin):
         web_component.register_endpoint("/tariff_savings", self.web_page, "GET")
         web_component.register_endpoint("/api/tariff_savings", self.web_api, "GET")
         web_component.register_endpoint("/api/tariff_savings/run", self.web_run_now, "GET")
+        self.log("TariffSavings: web endpoints registered (/tariff_savings, /api/tariff_savings, /api/tariff_savings/run)")
 
     def _summarise(self, tariff_id, start=None, end=None):
         rows = []
