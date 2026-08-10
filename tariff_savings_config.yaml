@@ -1,0 +1,21 @@
+# Add this to apps.yaml.
+#
+# The simplest option is to reuse the existing Predbat compare_list.
+# Only import pricing is used for the no-solar/no-battery baseline.
+
+tariff_savings:
+  enabled: true
+  process_hour: 2
+
+  tariffs:
+    mode: compare_list
+    import_only: true
+
+# Or use:
+#
+#  tariffs:
+#    mode: custom
+#    list:
+#      - id: agile
+#        name: Octopus Agile
+#        rates_import_octopus_url: "https://..."

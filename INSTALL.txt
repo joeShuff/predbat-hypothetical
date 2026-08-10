@@ -1,0 +1,10 @@
+Predbat Tariff Savings Plugin
+
+1. Copy tariff_savings_plugin.py into your Predbat apps/predbat directory.
+2. Add the tariff_savings block from tariff_savings_config.yaml to apps.yaml.
+3. Restart Predbat.
+4. The plugin is auto-discovered because the filename ends in _plugin.py.
+5. Open the Predbat web interface and visit /tariff_savings.
+
+The plugin stores its permanent history through Predbat Storage with no expiry.
+See README.md for configuration and behaviour.
