@@ -574,6 +574,7 @@ class TariffSavingsPlugin(PredBatPlugin):
             return
         web_component.register_endpoint("/tariff_savings", self.web_page, "GET")
         web_component.register_endpoint("/api/tariff_savings", self.web_api, "GET")
+        web_component.register_endpoint("/api/tariff_savings/run", self.web_run_now, "GET")
 
     def _summarise(self, tariff_id, start=None, end=None):
         rows = []
@@ -638,6 +639,77 @@ class TariffSavingsPlugin(PredBatPlugin):
                 ],
                 "selected": tariff_id,
                 "summary": self._summarise(tariff_id, start, end) if tariff_id else {},
+            }
+        )
+
+    async def web_run_now(self, request):
+        """Manually (re)process a day on demand, for setup/debugging.
+
+        GET /api/tariff_savings/run?date=YYYY-MM-DD&force=1
+
+        - date defaults to "yesterday" (local calendar day).
+        - force=1 clears any existing stored result for that day first, so
+          you can re-run after fixing config without waiting for a new day.
+        - Log messages produced during processing are captured and returned
+          in the response, so failures (missing load data, missing actual
+          cost, no tariffs, incomplete rate coverage, etc.) are visible
+          immediately instead of only in the Predbat log file.
+        """
+        from aiohttp import web
+
+        query = parse_qs(request.query_string)
+        date_param = query.get("date", [None])[0]
+        force = query.get("force", ["0"])[0] in ("1", "true", "yes")
+
+        if date_param:
+            target_date = date_param
+        else:
+            now = getattr(self.base, "now_utc", None)
+            if not now:
+                return web.json_response(
+                    {"ok": False, "error": "base.now_utc unavailable"}, status=500
+                )
+            target_date = (now.date() - timedelta(days=1)).isoformat()
+
+        try:
+            datetime.strptime(target_date, "%Y-%m-%d")
+        except ValueError:
+            return web.json_response(
+                {"ok": False, "error": "date must be YYYY-MM-DD"}, status=400
+            )
+
+        if not self.loaded:
+            self._load_storage()
+
+        already_present = target_date in self.history.get("days", {})
+        if force and already_present:
+            self.history["days"].pop(target_date, None)
+
+        captured = []
+        original_log = self.log
+
+        def _capture_log(message, *args, **kwargs):
+            captured.append(str(message))
+            return original_log(message, *args, **kwargs)
+
+        self.log = _capture_log
+        try:
+            success = self._process_day(target_date)
+        except Exception as exc:  # pylint: disable=broad-except
+            captured.append("Exception: {}".format(exc))
+            success = False
+        finally:
+            self.log = original_log
+
+        record = self.history.get("days", {}).get(target_date)
+        return web.json_response(
+            {
+                "ok": bool(success),
+                "date": target_date,
+                "forced": force,
+                "already_present_before_run": already_present,
+                "log": captured,
+                "result": record,
             }
         )
 
