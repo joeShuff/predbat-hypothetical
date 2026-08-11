@@ -84,7 +84,12 @@ class TariffSavingsPlugin(_PredBatPluginBase):
             tariff = copy.deepcopy(item)
             tariff_id = str(tariff.get("id") or tariff.get("name") or "tariff")
             tariff["id"] = tariff_id
-
+            # This comparison answers "what would my load have cost if I'd
+            # imported all of it on tariff X, with no solar/battery offset?"
+            # Export rates are never relevant to that question. No filtering
+            # is needed here: downstream code (rate fetching, cost calc) only
+            # ever reads import-related keys (id, name, rates_import*,
+            # metric_*import*), so any export/unrelated keys just sit unused.
             result.append(tariff)
         return result
 
@@ -272,11 +277,11 @@ class TariffSavingsPlugin(_PredBatPluginBase):
     # Actual cost
     # ------------------------------------------------------------------
 
-    def _history_entity_final(self, entity_id, target_date):
+    def _history_entity_final(self, entity_id, target_date, days=2):
         """Find the latest state for an entity on a local calendar day."""
         try:
             history = self.base.get_history_wrapper(
-                entity_id=entity_id, days=2, required=False
+                entity_id=entity_id, days=days, required=False
             )
         except Exception as exc:  # pylint: disable=broad-except
             self.log("TariffSavings: history lookup failed for {}: {}".format(entity_id, exc))
@@ -312,11 +317,20 @@ class TariffSavingsPlugin(_PredBatPluginBase):
         return best
 
     def _actual_cost(self, target_date):
+        days_back = 2
+        now = getattr(self.base, "now_utc", None)
+        if now:
+            try:
+                target = datetime.strptime(target_date, "%Y-%m-%d").date()
+                days_back = max(2, (now.date() - target).days + 1)
+            except ValueError:
+                pass
+
         import_p = self._history_entity_final(
-            self.base.prefix + ".cost_today_import", target_date
+            self.base.prefix + ".cost_today_import", target_date, days=days_back
         )
         export_p = self._history_entity_final(
-            self.base.prefix + ".cost_today_export", target_date
+            self.base.prefix + ".cost_today_export", target_date, days=days_back
         )
 
         if import_p is None or export_p is None:
@@ -575,7 +589,11 @@ class TariffSavingsPlugin(_PredBatPluginBase):
         web_component.register_endpoint("/tariff_savings", self.web_page, "GET")
         web_component.register_endpoint("/api/tariff_savings", self.web_api, "GET")
         web_component.register_endpoint("/api/tariff_savings/run", self.web_run_now, "GET")
-        self.log("TariffSavings: web endpoints registered (/tariff_savings, /api/tariff_savings, /api/tariff_savings/run)")
+        web_component.register_endpoint("/api/tariff_savings/run_all", self.web_run_all, "GET")
+        self.log(
+            "TariffSavings: web endpoints registered "
+            "(/tariff_savings, /api/tariff_savings, /api/tariff_savings/run, /api/tariff_savings/run_all)"
+        )
 
     def _summarise(self, tariff_id, start=None, end=None):
         rows = []
@@ -711,6 +729,108 @@ class TariffSavingsPlugin(_PredBatPluginBase):
                 "already_present_before_run": already_present,
                 "log": captured,
                 "result": record,
+            }
+        )
+
+    async def web_run_all(self, request):
+        """Backfill every day Predbat/HA still has data for.
+
+        GET /api/tariff_savings/run_all?force=1&max_days=60&stop_after_misses=3
+
+        Walks backwards from yesterday, calling _process_day() for each date,
+        until `stop_after_misses` consecutive dates in a row produce no load
+        data (i.e. we've walked past the edge of whatever history Predbat's
+        in-memory load_minutes / HA's recorder still retain), or `max_days`
+        is reached, whichever comes first. A single missing day (e.g. a
+        restart-related gap) does not stop the walk - only a run of misses
+        does, so real gaps don't get mistaken for the edge of history.
+
+        - force=1 reprocesses days that are already stored, overwriting them
+          with the current tariff config (useful after a config change).
+        - Without force, already-stored days are left untouched and reported
+          as skipped, and only count towards the "no data" streak if they
+          were never processable in the first place - already-present days
+          never contribute to stop_after_misses.
+        """
+        from aiohttp import web
+
+        query = parse_qs(request.query_string)
+        force = query.get("force", ["0"])[0] in ("1", "true", "yes")
+        try:
+            max_days = int(query.get("max_days", ["60"])[0])
+        except ValueError:
+            max_days = 60
+        try:
+            stop_after_misses = int(query.get("stop_after_misses", ["3"])[0])
+        except ValueError:
+            stop_after_misses = 3
+        max_days = max(1, min(max_days, 365))
+        stop_after_misses = max(1, stop_after_misses)
+
+        now = getattr(self.base, "now_utc", None)
+        if not now:
+            return web.json_response(
+                {"ok": False, "error": "base.now_utc unavailable"}, status=500
+            )
+
+        if not self.loaded:
+            self._load_storage()
+
+        processed = []
+        skipped = []
+        failed = []
+        consecutive_misses = 0
+        cursor = now.date() - timedelta(days=1)
+        days_walked = 0
+
+        while days_walked < max_days and consecutive_misses < stop_after_misses:
+            target_date = cursor.isoformat()
+            days_walked += 1
+            cursor -= timedelta(days=1)
+
+            already_present = target_date in self.history.get("days", {})
+            if already_present and not force:
+                skipped.append(target_date)
+                continue
+            if already_present and force:
+                self.history["days"].pop(target_date, None)
+
+            captured = []
+            original_log = self.log
+
+            def _capture_log(message, *args, **kwargs):
+                captured.append(str(message))
+                return original_log(message, *args, **kwargs)
+
+            self.log = _capture_log
+            try:
+                success = self._process_day(target_date)
+            except Exception as exc:  # pylint: disable=broad-except
+                captured.append("Exception: {}".format(exc))
+                success = False
+            finally:
+                self.log = original_log
+
+            if success:
+                consecutive_misses = 0
+                processed.append(target_date)
+            else:
+                consecutive_misses += 1
+                failed.append({"date": target_date, "log": captured})
+
+        return web.json_response(
+            {
+                "ok": True,
+                "days_walked": days_walked,
+                "stopped_reason": (
+                    "no_more_data"
+                    if consecutive_misses >= stop_after_misses
+                    else "max_days_reached"
+                ),
+                "processed": processed,
+                "processed_count": len(processed),
+                "skipped_already_present": skipped,
+                "failed": failed,
             }
         )
 
