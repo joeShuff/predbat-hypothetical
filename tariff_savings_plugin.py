@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from urllib.parse import parse_qs
 
-from plugin_system import PredBatPlugin
+from plugin_system import PredBatPlugin as _PredBatPluginBase
 from ha import run_async
 
 UTC = timezone.utc
@@ -28,7 +28,7 @@ CURRENT_FILE = "current"
 VERSION = 1
 
 
-class TariffSavingsPlugin(PredBatPlugin):
+class TariffSavingsPlugin(_PredBatPluginBase):
     """Persistently compare actual load against historical tariff costs."""
 
     def __init__(self, base):
@@ -84,12 +84,7 @@ class TariffSavingsPlugin(PredBatPlugin):
             tariff = copy.deepcopy(item)
             tariff_id = str(tariff.get("id") or tariff.get("name") or "tariff")
             tariff["id"] = tariff_id
-            if mode != "custom" or tariffs.get("import_only", True):
-                # Savings is an import-only baseline. Export configuration is
-                # intentionally irrelevant and is not fetched.
-                for key in list(tariff):
-                    if key.startswith("rates_export") or key.startswith("metric_") and "import" not in key:
-                        tariff.pop(key, None)
+
             result.append(tariff)
         return result
 

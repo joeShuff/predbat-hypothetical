@@ -9,7 +9,6 @@ tariff_savings:
 
   tariffs:
     mode: compare_list
-    import_only: true
 
 # Or use:
 #
