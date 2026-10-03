@@ -16,7 +16,7 @@ auditable even if the tariff configuration later changes.
 import copy
 from datetime import datetime, timedelta, timezone
 from html import escape
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from plugin_system import PredBatPlugin as _PredBatPluginBase
 from ha import run_async
@@ -353,14 +353,81 @@ class TariffSavingsPlugin(_PredBatPluginBase):
     # Tariff rate fetching
     # ------------------------------------------------------------------
 
+    def _octopus_url_for_date(self, url, target_date):
+        """Point a standard-unit-rates URL at a specific historical day.
+
+        Without period_from/period_to, Octopus's API returns its default
+        window (roughly "current and upcoming"), never arbitrary past days.
+        We add/override those two query params so the call is pinned to the
+        target local calendar day. Any other existing query params on the
+        configured URL (e.g. page_size) are preserved.
+        """
+        pb = self.base
+        target = datetime.strptime(target_date, "%Y-%m-%d").date()
+        start_local = datetime.combine(target, datetime.min.time())
+        end_local = datetime.combine(target, datetime.max.time().replace(microsecond=0))
+
+        local_tz = getattr(pb, "local_tz", None)
+        if local_tz is not None:
+            if hasattr(local_tz, "localize"):
+                start_local = local_tz.localize(start_local)
+                end_local = local_tz.localize(end_local)
+            else:
+                start_local = start_local.replace(tzinfo=local_tz)
+                end_local = end_local.replace(tzinfo=local_tz)
+
+        period_from = start_local.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        period_to = end_local.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        parts = urlsplit(url)
+        params = dict(parse_qsl(parts.query))
+        params["period_from"] = period_from
+        params["period_to"] = period_to
+        new_query = urlencode(params)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
     def _fetch_import_rates(self, tariff, target_date):
         """Fetch import rates using the same source types as compare_list."""
         pb = self.base
 
         if tariff.get("rates_import_octopus_url"):
-            return pb.download_octopus_rates(
-                pb.resolve_arg("rates_import_octopus_url", tariff["rates_import_octopus_url"], indirect=False)
+            url = pb.resolve_arg("rates_import_octopus_url", tariff["rates_import_octopus_url"], indirect=False)
+            url = self._octopus_url_for_date(url, target_date)
+
+            # download_octopus_rates() internally calls minute_data(mdata, 3,
+            # self.midnight_utc, ...), which keeps only entries within +/-3
+            # days of self.midnight_utc (today) and discards the rest. For a
+            # target_date more than 3 days ago this would silently return an
+            # empty/partial dict even with the right URL. Temporarily point
+            # midnight_utc at the target day so the 3-day window is centred
+            # on it instead, then re-key the result back onto the real
+            # midnight_utc so offsets line up with what _rate_for_slot (which
+            # always uses the real, current midnight_utc) expects.
+            real_midnight_utc = pb.midnight_utc
+            target_midnight_local = datetime.combine(
+                datetime.strptime(target_date, "%Y-%m-%d").date(), datetime.min.time()
             )
+            local_tz = getattr(pb, "local_tz", None)
+            if local_tz is not None:
+                if hasattr(local_tz, "localize"):
+                    target_midnight_local = local_tz.localize(target_midnight_local)
+                else:
+                    target_midnight_local = target_midnight_local.replace(tzinfo=local_tz)
+            target_midnight_utc = target_midnight_local.astimezone(UTC)
+
+            try:
+                pb.midnight_utc = target_midnight_utc
+                rates = pb.download_octopus_rates(url)
+            finally:
+                pb.midnight_utc = real_midnight_utc
+
+            if not rates or real_midnight_utc is None:
+                return rates
+
+            shift = int((target_midnight_utc - real_midnight_utc).total_seconds() / 60)
+            if shift == 0:
+                return rates
+            return {key + shift: value for key, value in rates.items()}
 
         if tariff.get("metric_octopus_import"):
             entity_id = pb.resolve_arg("metric_octopus_import", tariff["metric_octopus_import"], indirect=False)
